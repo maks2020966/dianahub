@@ -1,5 +1,5 @@
 """
-Telegram-бот "Помощник по домашке" с новым дизайном
+Telegram-бот "Помощник по домашке" с новым дизайном (Адаптирован под Render)
 """
 
 import logging
@@ -7,9 +7,13 @@ import os
 import uuid
 import base64
 import re
+import asyncio
 from io import BytesIO
 import requests
 from PIL import Image, ImageDraw, ImageFont
+from flask import Flask
+from threading import Thread
+
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
@@ -19,14 +23,30 @@ from telegram.ext import (
     filters,
 )
 
-# ==================== НАСТРОЙКИ ====================
+# ==================== ВЕБ-СЕРВЕР ДЛЯ РАБОТЫ 24/7 ====================
 
-TELEGRAM_TOKEN = "8983539613:AAFQLnAyx6KETqIyJBgBQk48IZg96CiXiA4"
-GROQ_API_KEY = "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"
+web_app = Flask('')
+
+@web_app.route('/')
+def home():
+    return "Bot is alive!"
+
+def run_web():
+    port = int(os.environ.get("PORT", 8080))
+    web_app.run(host='0.0.0.0', port=port)
+
+def start_keep_alive():
+    t = Thread(target=run_web)
+    t.daemon = True
+    t.start()
+
+# ==================== НАСТРОЙКИ (БЕЗОПАСНЫЕ КЛЮЧИ) ====================
+
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 
 # ID стикера, который бот отправляет, пока думает.
-# Чтобы получить ID нужного стикера, перешли его боту @idstickerbot в Telegram.
-THINKING_STICKER_ID = "CAACAgIAAxkBAAER0GRqlTTPt9_45o-7jz-1uWlpGqz9BwACswgAAtdXGgdDqCNw-LSLGj0E"  # <-- ВСТАВЬ СЮДА ID СТИКЕРА
+THINKING_STICKER_ID = "CAACAgIAAxkBAAER0GRqlTTPt9_45o-7jz-1uWlpGqz9BwACswgAAtdXGgdDqCNw-LSLGj0E"
 
 INTRO_VIDEO_PATH = "diana_hub_intro.mp4"
 
@@ -103,7 +123,6 @@ def ask_groq_vision(image_url: str, caption: str = "") -> str:
 # ==================== РЕНДЕР ОТВЕТА В КАРТИНКУ ====================
 
 def wrap_text(text: str, font, max_width: int, draw: ImageDraw.Draw) -> list[str]:
-    """Разбивает текст на строки по ширине."""
     lines = []
     for paragraph in text.split('\n'):
         words = paragraph.split(' ')
@@ -119,10 +138,8 @@ def wrap_text(text: str, font, max_width: int, draw: ImageDraw.Draw) -> list[str
     return lines
 
 def render_styled_answer(answer_text: str) -> str:
-    """Отрисовывает ответ по шаблону 2 фото на одной длинной картинке."""
     os.makedirs(TMP_DIR, exist_ok=True)
     
-    # Пытаемся распарсить ответ
     subject = re.search(r"ПРЕДМЕТ:\s*(.*)", answer_text, re.IGNORECASE)
     condition = re.search(r"УСЛОВИЕ:\s*(.*?)(?=ШАГИ:)", answer_text, re.IGNORECASE | re.DOTALL)
     steps = re.search(r"ШАГИ:\s*(.*?)(?=ОТВЕТ:)", answer_text, re.IGNORECASE | re.DOTALL)
@@ -137,22 +154,19 @@ def render_styled_answer(answer_text: str) -> str:
         font_reg = ImageFont.truetype(FONT_REGULAR, IMG_FONT_SIZE)
         font_bold = ImageFont.truetype(FONT_BOLD, IMG_FONT_SIZE)
         font_title = ImageFont.truetype(FONT_BOLD, IMG_TITLE_FONT_SIZE)
-    except:
+    except Exception:
         font_reg = font_bold = font_title = ImageFont.load_default()
 
-    # Временный холст для расчетов высоты
     tmp_img = Image.new("RGB", (10, 10))
     tmp_draw = ImageDraw.Draw(tmp_img)
-    max_text_width = IMG_WIDTH - (IMG_PADDING * 4) # Отступы внутри блоков
+    max_text_width = IMG_WIDTH - (IMG_PADDING * 4)
 
-    # Оборачиваем тексты
     cond_lines = wrap_text(cond_text, font_reg, max_text_width, tmp_draw)
-    steps_lines = wrap_text(steps_text, font_reg, max_text_width - 20, tmp_draw) # -20 для синей полоски
+    steps_lines = wrap_text(steps_text, font_reg, max_text_width - 20, tmp_draw)
     ans_lines = wrap_text(ans_text, font_reg, max_text_width, tmp_draw)
 
     line_height = tmp_draw.textbbox((0, 0), "Ay", font=font_reg)[3]
     
-    # Считаем общую высоту картинки
     h_header = 100
     h_cond = len(cond_lines) * (line_height + 5) + 60
     h_steps = len(steps_lines) * (line_height + 5) + 40
@@ -171,7 +185,7 @@ def render_styled_answer(answer_text: str) -> str:
     draw.line([(IMG_PADDING, current_y), (IMG_WIDTH - IMG_PADDING, current_y)], fill=(59, 130, 246), width=3)
     current_y += 30
 
-    # 2. УСЛОВИЕ (Голубой блок)
+    # 2. УСЛОВИЕ
     cond_box_h = len(cond_lines) * (line_height + 5) + 50
     draw.rounded_rectangle(
         [(IMG_PADDING, current_y), (IMG_WIDTH - IMG_PADDING, current_y + cond_box_h)], 
@@ -184,13 +198,11 @@ def render_styled_answer(answer_text: str) -> str:
         cy += line_height + 5
     current_y += cond_box_h + 30
 
-    # 3. ШАГИ РЕШЕНИЯ (с синей полосой слева)
-    # Рисуем вертикальную полосу
+    # 3. ШАГИ РЕШЕНИЯ
     steps_box_h = len(steps_lines) * (line_height + 5) + 20
     draw.line([(IMG_PADDING + 10, current_y), (IMG_PADDING + 10, current_y + steps_box_h)], fill=(59, 130, 246), width=4)
     cy = current_y
     for line in steps_lines:
-        # Подсветка слов "Шаг X:"
         if line.lower().startswith("шаг"):
             draw.text((IMG_PADDING + 30, cy), line, font=font_bold, fill=(59, 130, 246))
         else:
@@ -198,10 +210,9 @@ def render_styled_answer(answer_text: str) -> str:
         cy += line_height + 5
     current_y += steps_box_h + 30
 
-    # 4. ИТОГОВЫЙ ОТВЕТ (Зеленый блок с "пунктиром" - заменен на обводку для надежности)
+    # 4. ИТОГОВЫЙ ОТВЕТ
     if ans_text:
         ans_box_h = len(ans_lines) * (line_height + 5) + 50
-        # Зеленая обводка
         draw.rounded_rectangle(
             [(IMG_PADDING, current_y), (IMG_WIDTH - IMG_PADDING, current_y + ans_box_h)], 
             radius=10, fill=(255, 255, 255), outline=(76, 175, 80), width=3
@@ -212,8 +223,7 @@ def render_styled_answer(answer_text: str) -> str:
             draw.text((IMG_PADDING + 20, cy), line, font=font_reg, fill=(30, 30, 30))
             cy += line_height + 5
 
-    # Обрезка пустой нижней части (если расчитали с запасом)
-    final_img = img.crop((0, 0, IMG_WIDTH, current_y + ans_box_h + 40))
+    final_img = img.crop((0, 0, IMG_WIDTH, current_y + (ans_box_h if ans_text else 0) + 40))
     
     path = os.path.join(TMP_DIR, f"answer_{uuid.uuid4().hex}.png")
     final_img.save(path)
@@ -229,11 +239,10 @@ async def send_answer_as_photos(update: Update, answer: str, sticker_msg=None):
         logger.error(f"Ошибка рендера: {e}")
         await update.message.reply_text(answer)
     finally:
-        # Удаляем стикер "Думаю", когда ответ готов
         if sticker_msg:
             try:
                 await sticker_msg.delete()
-            except:
+            except Exception:
                 pass
 
 # ==================== ХЕНДЛЕРЫ TELEGRAM ====================
@@ -243,17 +252,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             with open(INTRO_VIDEO_PATH, "rb") as video_file:
                 await update.message.reply_video(video=video_file)
-        except Exception as e:
+        except Exception:
             pass
     await update.message.reply_text("Привет 👋\nОтправь фото или текст задания!")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Отправляем стикер "Думаю..."
     sticker_msg = None
     try:
         sticker_msg = await update.message.reply_sticker(THINKING_STICKER_ID)
-    except:
-        pass # Если ID неверный, просто проигнорируем
+    except Exception:
+        pass
 
     question = update.message.text
     answer = ask_groq(question)
@@ -263,7 +271,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sticker_msg = None
     try:
         sticker_msg = await update.message.reply_sticker(THINKING_STICKER_ID)
-    except:
+    except Exception:
         pass
 
     photo = update.message.photo[-1]
@@ -279,6 +287,10 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_answer_as_photos(update, answer, sticker_msg)
 
 def main():
+    if not TELEGRAM_TOKEN:
+        logger.error("ОШИБКА: TELEGRAM_TOKEN не найден в переменной окружения!")
+        return
+
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
@@ -288,4 +300,15 @@ def main():
     app.run_polling()
 
 if __name__ == "__main__":
+    # 1. Запуск фонового Flask-сервера для Render
+    start_keep_alive()
+
+    # 2. Фикс asyncio loop для новых версий Python
+    try:
+        asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
+    # 3. Запуск бота
     main()

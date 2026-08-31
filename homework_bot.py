@@ -1,5 +1,6 @@
 """
-Telegram-бот "Помощник по домашке" с новым дизайном (Адаптирован под Render)
+Telegram-бот "Помощник по домашке"
+Оптимизирован для работы 24/7 на Render
 """
 
 import logging
@@ -9,10 +10,11 @@ import base64
 import re
 import asyncio
 from io import BytesIO
+from threading import Thread
+
 import requests
 from PIL import Image, ImageDraw, ImageFont
 from flask import Flask
-from threading import Thread
 
 from telegram import Update
 from telegram.ext import (
@@ -23,9 +25,53 @@ from telegram.ext import (
     filters,
 )
 
-# ==================== ВЕБ-СЕРВЕР ДЛЯ РАБОТЫ 24/7 ====================
+# ==================== НАСТРОЙКИ И ЛОГИРОВАНИЕ ====================
 
-web_app = Flask('')
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+# Отключаем лишний шум от Flask в логах
+logging.getLogger('werkzeug').setLevel(logging.ERROR)
+
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
+
+THINKING_STICKER_ID = "CAACAgIAAxkBAAER0GRqlTTPt9_45o-7jz-1uWlpGqz9BwACswgAAtdXGgdDqCNw-LSLGj0E"
+INTRO_VIDEO_PATH = "diana_hub_intro.mp4"
+
+GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_MODEL = "openai/gpt-oss-20b"
+GROQ_VISION_MODEL = "qwen/qwen3.6-27b"
+
+# ---- Настройки картинки ----
+IMG_WIDTH = 900
+IMG_PADDING = 40
+IMG_FONT_SIZE = 24
+IMG_TITLE_FONT_SIZE = 28
+TMP_DIR = "tmp_answers"
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+FONT_REGULAR_PATH = os.path.join(SCRIPT_DIR, "fonts", "DejaVuSans.ttf")
+FONT_BOLD_PATH = os.path.join(SCRIPT_DIR, "fonts", "DejaVuSans-Bold.ttf")
+
+SYSTEM_PROMPT = (
+    "Ты — умный школьный помощник. Решай задачи по шагам. "
+    "Твой ответ СТРОГО должен быть в таком формате (без markdown разметки типа **):\n"
+    "ПРЕДМЕТ: [Название предмета и класс]\n"
+    "УСЛОВИЕ: [Кратко перепиши условие задачи]\n"
+    "ШАГИ:\n"
+    "Шаг 1: [описание шага]\n"
+    "Шаг 2: [описание шага, если нужно]\n"
+    "ОТВЕТ: [Краткий итоговый ответ]\n\n"
+    "Никогда не отклоняйся от этого шаблона."
+)
+
+# ==================== ВЕБ-СЕРВЕР ДЛЯ RENDER (PORT BINDING) ====================
+
+web_app = Flask(__name__)
 
 @web_app.route('/')
 def home():
@@ -36,91 +82,57 @@ def run_web():
     web_app.run(host='0.0.0.0', port=port)
 
 def start_keep_alive():
-    t = Thread(target=run_web)
-    t.daemon = True
+    t = Thread(target=run_web, daemon=True)
     t.start()
 
-# ==================== НАСТРОЙКИ (БЕЗОПАСНЫЕ КЛЮЧИ) ====================
+# ==================== ЗАПРОСЫ К GROQ API ====================
 
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
-
-# ID стикера, который бот отправляет, пока думает.
-THINKING_STICKER_ID = "CAACAgIAAxkBAAER0GRqlTTPt9_45o-7jz-1uWlpGqz9BwACswgAAtdXGgdDqCNw-LSLGj0E"
-
-INTRO_VIDEO_PATH = "diana_hub_intro.mp4"
-
-GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
-GROQ_MODEL = "openai/gpt-oss-20b" 
-GROQ_VISION_MODEL = "qwen/qwen3.6-27b" 
-
-# ---- Настройки картинки с ответом ----
-IMG_WIDTH = 900
-IMG_PADDING = 40
-IMG_FONT_SIZE = 24
-IMG_TITLE_FONT_SIZE = 28
-IMG_SMALL_FONT_SIZE = 20
-
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-FONT_REGULAR = os.path.join(SCRIPT_DIR, "fonts", "DejaVuSans.ttf")
-FONT_BOLD = os.path.join(SCRIPT_DIR, "fonts", "DejaVuSans-Bold.ttf")
-TMP_DIR = "tmp_answers"
-
-# Жесткий промпт, чтобы AI возвращал структурированный текст
-SYSTEM_PROMPT = (
-    "Ты — умный школьный помощник. Решай задачи по шагам. "
-    "Твой ответ СТРОГО должен быть в таком формате (без markdown разметки типа **):\n"
-    "ПРЕДМЕТ: [Название предмета и класс, например: МАТЕМАТИКА • НАЧАЛЬНАЯ ШКОЛА (1-4 КЛАССЫ)]\n"
-    "УСЛОВИЕ: [Кратко перепиши условие задачи]\n"
-    "ШАГИ:\n"
-    "Шаг 1: [описание шага]\n"
-    "Шаг 2: [описание шага, если нужно]\n"
-    "ОТВЕТ: [Краткий итоговый ответ]\n\n"
-    "Никогда не отклоняйся от этого шаблона."
-)
-
-logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-# ==================== ЗАПРОС К AI ====================
-
-def ask_groq(question: str) -> str:
-    headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
-    payload = {
-        "model": GROQ_MODEL,
-        "messages": [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": question}],
-        "temperature": 0.3,
-        "max_tokens": 1500,
-    }
-    try:
-        response = requests.post(GROQ_API_URL, headers=headers, json=payload, timeout=30)
-        response.raise_for_status()
-        return response.json()["choices"][0]["message"]["content"]
-    except Exception as e:
-        logger.error(f"Ошибка запроса к Groq: {e}")
-        return "⚠️ Ошибка API."
-
-def ask_groq_vision(image_url: str, caption: str = "") -> str:
-    headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
-    user_text = caption.strip() if caption.strip() else "Реши это задание."
-    payload = {
-        "model": GROQ_VISION_MODEL,
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": [{"type": "text", "text": user_text}, {"type": "image_url", "image_url": {"url": image_url}}]},
-        ],
-        "temperature": 0.3,
-        "max_tokens": 1500,
+def fetch_groq_sync(payload: dict) -> str:
+    """Синхронный запрос к Groq (запускается в отдельном потоке)."""
+    headers = {
+        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Content-Type": "application/json"
     }
     try:
         response = requests.post(GROQ_API_URL, headers=headers, json=payload, timeout=45)
         response.raise_for_status()
         return response.json()["choices"][0]["message"]["content"]
     except Exception as e:
-        logger.error(f"Ошибка запроса к Groq (vision): {e}")
-        return "⚠️ Ошибка API."
+        logger.error(f"Ошибка запроса к Groq: {e}")
+        return "⚠️ Не удалось получить ответ от ИИ. Попробуй позже."
 
-# ==================== РЕНДЕР ОТВЕТА В КАРТИНКУ ====================
+async def ask_groq(question: str) -> str:
+    payload = {
+        "model": GROQ_MODEL,
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": question}
+        ],
+        "temperature": 0.3,
+        "max_tokens": 1500,
+    }
+    return await asyncio.to_thread(fetch_groq_sync, payload)
+
+async def ask_groq_vision(image_url: str, caption: str = "") -> str:
+    user_text = caption.strip() if caption.strip() else "Реши это задание."
+    payload = {
+        "model": GROQ_VISION_MODEL,
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": user_text},
+                    {"type": "image_url", "image_url": {"url": image_url}}
+                ]
+            },
+        ],
+        "temperature": 0.3,
+        "max_tokens": 1500,
+    }
+    return await asyncio.to_thread(fetch_groq_sync, payload)
+
+# ==================== РЕНДЕР КАРТИНКИ С ОТВЕТОМ ====================
 
 def wrap_text(text: str, font, max_width: int, draw: ImageDraw.Draw) -> list[str]:
     lines = []
@@ -132,12 +144,15 @@ def wrap_text(text: str, font, max_width: int, draw: ImageDraw.Draw) -> list[str
             if draw.textbbox((0, 0), test_line, font=font)[2] <= max_width:
                 current_line = test_line
             else:
-                if current_line: lines.append(current_line)
+                if current_line:
+                    lines.append(current_line)
                 current_line = word
-        if current_line: lines.append(current_line)
+        if current_line:
+            lines.append(current_line)
     return lines
 
-def render_styled_answer(answer_text: str) -> str:
+def render_styled_answer_sync(answer_text: str) -> str:
+    """Синхронный рендеринг изображения (запускается в отдельном потоке)."""
     os.makedirs(TMP_DIR, exist_ok=True)
     
     subject = re.search(r"ПРЕДМЕТ:\s*(.*)", answer_text, re.IGNORECASE)
@@ -145,15 +160,15 @@ def render_styled_answer(answer_text: str) -> str:
     steps = re.search(r"ШАГИ:\s*(.*?)(?=ОТВЕТ:)", answer_text, re.IGNORECASE | re.DOTALL)
     final_answer = re.search(r"ОТВЕТ:\s*(.*)", answer_text, re.IGNORECASE | re.DOTALL)
 
-    sub_text = subject.group(1).strip().upper() if subject else "ПРЕДМЕТ НЕ ОПРЕДЕЛЕН"
-    cond_text = condition.group(1).strip() if condition else "Нет условия"
+    sub_text = subject.group(1).strip().upper() if subject else "РЕШЕНИЕ ЗАДАЧИ"
+    cond_text = condition.group(1).strip() if condition else "Условие не указано"
     steps_text = steps.group(1).strip() if steps else answer_text
     ans_text = final_answer.group(1).strip() if final_answer else ""
 
     try:
-        font_reg = ImageFont.truetype(FONT_REGULAR, IMG_FONT_SIZE)
-        font_bold = ImageFont.truetype(FONT_BOLD, IMG_FONT_SIZE)
-        font_title = ImageFont.truetype(FONT_BOLD, IMG_TITLE_FONT_SIZE)
+        font_reg = ImageFont.truetype(FONT_REGULAR_PATH, IMG_FONT_SIZE)
+        font_bold = ImageFont.truetype(FONT_BOLD_PATH, IMG_FONT_SIZE)
+        font_title = ImageFont.truetype(FONT_BOLD_PATH, IMG_TITLE_FONT_SIZE)
     except Exception:
         font_reg = font_bold = font_title = ImageFont.load_default()
 
@@ -178,14 +193,14 @@ def render_styled_answer(answer_text: str) -> str:
 
     current_y = 40
 
-    # 1. ЗАГОЛОВОК
+    # 1. Заголовок
     draw.text((IMG_PADDING, current_y), sub_text, font=font_title, fill=(59, 130, 246))
     draw.text((IMG_WIDTH - IMG_PADDING - 120, current_y + 8), "@dianahub", font=font_reg, fill=(150, 150, 150))
     current_y += 45
     draw.line([(IMG_PADDING, current_y), (IMG_WIDTH - IMG_PADDING, current_y)], fill=(59, 130, 246), width=3)
     current_y += 30
 
-    # 2. УСЛОВИЕ
+    # 2. Условие
     cond_box_h = len(cond_lines) * (line_height + 5) + 50
     draw.rounded_rectangle(
         [(IMG_PADDING, current_y), (IMG_WIDTH - IMG_PADDING, current_y + cond_box_h)], 
@@ -198,7 +213,7 @@ def render_styled_answer(answer_text: str) -> str:
         cy += line_height + 5
     current_y += cond_box_h + 30
 
-    # 3. ШАГИ РЕШЕНИЯ
+    # 3. Шаги решения
     steps_box_h = len(steps_lines) * (line_height + 5) + 20
     draw.line([(IMG_PADDING + 10, current_y), (IMG_PADDING + 10, current_y + steps_box_h)], fill=(59, 130, 246), width=4)
     cy = current_y
@@ -210,7 +225,7 @@ def render_styled_answer(answer_text: str) -> str:
         cy += line_height + 5
     current_y += steps_box_h + 30
 
-    # 4. ИТОГОВЫЙ ОТВЕТ
+    # 4. Итоговый ответ
     if ans_text:
         ans_box_h = len(ans_lines) * (line_height + 5) + 50
         draw.rounded_rectangle(
@@ -231,12 +246,13 @@ def render_styled_answer(answer_text: str) -> str:
 
 async def send_answer_as_photos(update: Update, answer: str, sticker_msg=None):
     try:
-        image_path = render_styled_answer(answer)
+        image_path = await asyncio.to_thread(render_styled_answer_sync, answer)
         with open(image_path, "rb") as photo_file:
             await update.message.reply_photo(photo=photo_file)
-        os.remove(image_path)
+        if os.path.exists(image_path):
+            os.remove(image_path)
     except Exception as e:
-        logger.error(f"Ошибка рендера: {e}")
+        logger.error(f"Ошибка рендеринга/отправки картинки: {e}")
         await update.message.reply_text(answer)
     finally:
         if sticker_msg:
@@ -252,9 +268,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             with open(INTRO_VIDEO_PATH, "rb") as video_file:
                 await update.message.reply_video(video=video_file)
-        except Exception:
-            pass
-    await update.message.reply_text("Привет 👋\nОтправь фото или текст задания!")
+        except Exception as e:
+            logger.warning(f"Не удалось отправить интро-видео: {e}")
+            
+    await update.message.reply_text("Привет 👋\nОтправь мне текст или фото задания, и я помогу его решить!")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sticker_msg = None
@@ -264,7 +281,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass
 
     question = update.message.text
-    answer = ask_groq(question)
+    answer = await ask_groq(question)
     await send_answer_as_photos(update, answer, sticker_msg)
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -283,32 +300,32 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     image_url = f"data:image/jpeg;base64,{image_b64}"
 
     caption = update.message.caption or ""
-    answer = ask_groq_vision(image_url, caption)
+    answer = await ask_groq_vision(image_url, caption)
     await send_answer_as_photos(update, answer, sticker_msg)
+
+# ==================== ЗАПУСК ПРИЛОЖЕНИЯ ====================
 
 def main():
     if not TELEGRAM_TOKEN:
-        logger.error("ОШИБКА: TELEGRAM_TOKEN не найден в переменной окружения!")
+        logger.critical("ОШИБКА: Переменная TELEGRAM_TOKEN не найдена!")
         return
+    if not GROQ_API_KEY:
+        logger.warning("ПРЕДУПРЕЖДЕНИЕ: Переменная GROQ_API_KEY не найдена!")
 
+    # 1. Запуск Flask веб-сервера для Render
+    start_keep_alive()
+
+    # 2. Инициализация и запуск Telegram бота
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+    
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
 
-    logger.info("Бот запущен...")
-    app.run_polling()
+    logger.info("Бот успешно запущен...")
+    
+    # drop_pending_updates=True спасает от telegram.error.Conflict при перезапусках
+    app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
-    # 1. Запуск фонового Flask-сервера для Render
-    start_keep_alive()
-
-    # 2. Фикс asyncio loop для новых версий Python
-    try:
-        asyncio.get_event_loop()
-    except RuntimeError:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-
-    # 3. Запуск бота
     main()
